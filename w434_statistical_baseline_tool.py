@@ -49,6 +49,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from typing import Optional
 
+from tqdm import tqdm
+
 
 UNIT_MULTIPLIERS = {
     "nOhm": 1e-9,
@@ -63,6 +65,7 @@ UNIT_MULTIPLIERS = {
     "uF": 1e-6,
     "mF": 1e-3,
     "F": 1.0,
+    "nA": 1e-9,
     "uA": 1e-6,
     "mA": 1e-3,
     "A": 1.0,
@@ -455,7 +458,7 @@ class BaselineBuilder:
         unit_report_counts: dict[str, int] = {}
         unit_passed_report_counts: dict[str, int] = {}
 
-        for report_path in report_paths:
+        for report_path in tqdm(list(report_paths), desc="Processing baseline files", unit="file"):
             try:
                 metadata, measurement_records = parser.parse_report(report_path)
             except Exception as exc:  # pylint: disable=broad-except
@@ -831,29 +834,56 @@ class ReportEvaluator:
 
 
 
-def collect_report_paths(input_directory: Path, recursive: bool) -> list[Path]:
-    """Collects candidate report files from a directory.
+def flatten_input_directories(input_directories_argument: list[list[str]] | list[str]) -> list[Path]:
+    """Flattens one or more --input-dir argument groups into Path objects.
 
     Args:
-        input_directory: Root directory containing report files.
+        input_directories_argument: Parsed argparse values for input directories.
+
+    Returns:
+        Flat list of Path objects.
+    """
+    flattened_directories: list[Path] = []
+    for entry in input_directories_argument:
+        if isinstance(entry, list):
+            flattened_directories.extend(Path(directory) for directory in entry)
+        else:
+            flattened_directories.append(Path(entry))
+    return flattened_directories
+
+
+
+def collect_report_paths(
+    input_directories: list[Path],
+    recursive: bool,
+    search_label: str = "Searching files",
+) -> list[Path]:
+    """Collects candidate report files from one or more directories.
+
+    Args:
+        input_directories: Root directories containing report files.
         recursive: Whether to recurse into subdirectories.
+        search_label: Progress label for file discovery.
 
     Returns:
         Sorted list of candidate text-like file paths.
     """
-    if recursive:
-        candidate_paths = [
-            path for path in input_directory.rglob("*") if path.is_file()
-        ]
-    else:
-        candidate_paths = [
-            path for path in input_directory.iterdir() if path.is_file()
-        ]
+    candidate_paths: list[Path] = []
+    for input_directory in tqdm(input_directories, desc=search_label, unit="dir"):
+        if recursive:
+            candidate_paths.extend(
+                path for path in input_directory.rglob("*") if path.is_file()
+            )
+        else:
+            candidate_paths.extend(
+                path for path in input_directory.iterdir() if path.is_file()
+            )
 
     text_suffixes = {".txt", ".log", ".rpt", ".out", ""}
-    filtered_paths = [
-        path for path in candidate_paths if path.suffix.lower() in text_suffixes
-    ]
+    filtered_paths: list[Path] = []
+    for path in tqdm(candidate_paths, desc="Filtering candidate files", unit="file"):
+        if path.suffix.lower() in text_suffixes:
+            filtered_paths.append(path)
     return sorted(filtered_paths)
 
 
@@ -971,9 +1001,13 @@ def build_command(arguments: argparse.Namespace) -> int:
     Returns:
         Process exit code.
     """
-    input_directory = Path(arguments.input_dir)
+    input_directories = flatten_input_directories(arguments.input_dirs)
     output_json_path = Path(arguments.output_json)
-    report_paths = collect_report_paths(input_directory, recursive=arguments.recursive)
+    report_paths = collect_report_paths(
+        input_directories=input_directories,
+        recursive=arguments.recursive,
+        search_label="Searching baseline directories",
+    )
     if not report_paths:
         print("ERROR: No candidate report files were found.")
         return 1
@@ -1086,18 +1120,22 @@ def evaluate_directory_command(arguments: argparse.Namespace) -> int:
         Process exit code.
     """
     baseline_json_path = Path(arguments.baseline_json)
-    input_directory = Path(arguments.input_dir)
+    input_directories = flatten_input_directories(arguments.input_dirs)
     loader = BaselineLoader()
     evaluator = ReportEvaluator()
     baseline_database = loader.load_from_json(baseline_json_path)
 
-    report_paths = collect_report_paths(input_directory, recursive=arguments.recursive)
+    report_paths = collect_report_paths(
+        input_directories=input_directories,
+        recursive=arguments.recursive,
+        search_label="Searching evaluation directories",
+    )
     if not report_paths:
         print("ERROR: No candidate report files were found.")
         return 1
 
     batch_results: list[dict[str, Any]] = []
-    for report_path in report_paths:
+    for report_path in tqdm(report_paths, desc="Evaluating batch reports", unit="file"):
         try:
             evaluation_result = evaluator.evaluate_report(
                 baseline_database=baseline_database,
@@ -1172,7 +1210,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  Build a baseline from all reports under a directory tree:\n"
-            "    python w434_statistical_baseline_tool.py build --input-dir ./reports --output-json ./baseline.json\n\n"
+            "    python w434_statistical_baseline_tool.py build --input-dir ./reports_a ./reports_b --output-json ./baseline.json\n\n"
             "  Evaluate one new report against that baseline:\n"
             "    python w434_statistical_baseline_tool.py evaluate --baseline-json ./baseline.json --report ./new_report.txt\n\n"
             "Notes:\n"
@@ -1191,8 +1229,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     build_parser.add_argument(
         "--input-dir",
+        dest="input_dirs",
+        action="append",
+        nargs="+",
         required=True,
-        help="Directory containing W434 text report files.",
+        metavar="DIR",
+        help=(
+            "One or more directories containing W434 text report files. "
+            "This option may be repeated."
+        ),
     )
     build_parser.add_argument(
         "--output-json",
@@ -1243,8 +1288,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     evaluate_dir_parser.add_argument(
         "--input-dir",
+        dest="input_dirs",
+        action="append",
+        nargs="+",
         required=True,
-        help="Directory containing report files to evaluate.",
+        metavar="DIR",
+        help=(
+            "One or more directories containing report files to evaluate. "
+            "This option may be repeated."
+        ),
     )
     evaluate_dir_parser.add_argument(
         "--recursive",
