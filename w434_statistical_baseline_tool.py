@@ -88,6 +88,12 @@ PARAMETERS_SECTION_PATTERN = re.compile(
     r"^\s*Parameters\s+for\s+(.+?)\s*$",
     re.IGNORECASE,
 )
+OVERALL_PASSED_PATTERN = re.compile(r"\bP\s*A\s*S\s*S\s*E\s*D\b", re.IGNORECASE)
+OVERALL_FAILED_PATTERN = re.compile(r"\bF\s*A\s*I\s*L\s*E\s*D\b", re.IGNORECASE)
+HEADER_FAILURE_RESULT_PATTERN = re.compile(
+    r"(fail(?:ed)?|errors?|open|short|arc)",
+    re.IGNORECASE,
+)
 
 MEASUREMENT_CATEGORY_CONTINUITY = "continuity"
 MEASUREMENT_CATEGORY_LV_ISOLATION = "lv_isolation"
@@ -221,6 +227,10 @@ class W434ReportParser:
         lines = [self._clean_line(line) for line in raw_text.splitlines()]
 
         metadata = self._extract_metadata(lines)
+        if self._header_has_failure(lines):
+            print(f"Skipping report due to header failure: {report_path}")
+            return metadata, []
+
         records: list[MeasurementRecord] = []
 
         unit_under_test = metadata.get("unit_under_test", "")
@@ -269,6 +279,45 @@ class W434ReportParser:
 
         return metadata, records
 
+    def _header_has_failure(self, lines: list[str]) -> bool:
+        """Returns True if the header summary indicates any failure condition."""
+        test_result_start_index: Optional[int] = None
+        for index, line in enumerate(lines):
+            normalized_letters = re.sub(r"[^a-z]", "", line.lower())
+            if normalized_letters == "testresult":
+                test_result_start_index = index + 1
+                break
+
+        if test_result_start_index is None:
+            return False
+
+        seen_summary_entry = False
+        for line in lines[test_result_start_index:]:
+            stripped = line.strip()
+            if not stripped and seen_summary_entry:
+                break
+
+            overall_banner_result = self._extract_overall_banner_result(stripped)
+            if overall_banner_result == "FAILED":
+                return True
+            if overall_banner_result == "PASSED":
+                break
+
+            if ":" not in line:
+                continue
+
+            result_text = line.split(":", 1)[1].strip()
+            if not result_text:
+                continue
+            seen_summary_entry = True
+
+            if result_text.lower() == "no commands":
+                continue
+            if HEADER_FAILURE_RESULT_PATTERN.search(result_text):
+                return True
+
+        return False
+
     def _clean_line(self, line: str) -> str:
         """Cleans up one raw line from the report."""
         line = line.replace("\x0c", " ")
@@ -308,13 +357,21 @@ class W434ReportParser:
                 metadata["datetime"] = stripped.split(":", 1)[1].strip()
             elif lower.startswith("serial number:"):
                 metadata["serial_number"] = stripped.split(":", 1)[1].strip()
-            normalized = re.sub(r"\s+", "", lower)
-            if "passed" in normalized:
-                metadata["overall_result"] = "PASSED"
-            elif "failed" in normalized:
-                metadata["overall_result"] = "FAILED"
+            overall_banner_result = self._extract_overall_banner_result(stripped)
+            if overall_banner_result is not None:
+                metadata["overall_result"] = overall_banner_result
 
         return metadata
+
+    def _extract_overall_banner_result(self, stripped_line: str) -> Optional[str]:
+        """Extracts explicit overall PASSED/FAILED banner from one line."""
+        if not stripped_line or ":" in stripped_line:
+            return None
+        if OVERALL_FAILED_PATTERN.search(stripped_line):
+            return "FAILED"
+        if OVERALL_PASSED_PATTERN.search(stripped_line):
+            return "PASSED"
+        return None
 
     def _parse_measurement_payload(
         self,
