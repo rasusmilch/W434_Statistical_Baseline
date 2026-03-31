@@ -84,6 +84,24 @@ IR_II_PATTERN = re.compile(
 NUMERIC_VALUE_PATTERN = re.compile(
     r"^(?P<censor>[<>])?\s*(?P<number>[+-]?\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)$"
 )
+PARAMETERS_SECTION_PATTERN = re.compile(
+    r"^\s*Parameters\s+for\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+MEASUREMENT_CATEGORY_CONTINUITY = "continuity"
+MEASUREMENT_CATEGORY_LV_ISOLATION = "lv_isolation"
+MEASUREMENT_CATEGORY_HV_ISOLATION_RESISTANCE = "hv_isolation_resistance"
+MEASUREMENT_CATEGORY_HV_DIELECTRIC_BREAKDOWN = "hv_dielectric_breakdown"
+MEASUREMENT_CATEGORY_OTHER = "other"
+
+SECTION_KIND_CONTINUITY = "continuity"
+SECTION_KIND_LV_ISOLATION = "lv_isolation"
+SECTION_KIND_HV_ISOLATION = "hv_isolation"
+SECTION_KIND_OTHER = "other"
+
+RESISTANCE_UNITS = {"nOhm", "uOhm", "mOhm", "Ohm", "kOhm", "MOhm", "GOhm"}
+CURRENT_UNITS = {"nA", "uA", "mA", "A"}
 
 
 @dataclass
@@ -122,6 +140,7 @@ class MeasurementRecord:
         numeric_value_si: Parsed numeric value in SI base units.
         engineering_unit: Original engineering unit.
         censor_type: None, "lower", or "upper".
+        measurement_category: Measurement category such as continuity or lv_isolation.
         measurement_key: Stable grouping key for baseline statistics.
     """
 
@@ -139,6 +158,7 @@ class MeasurementRecord:
     numeric_value_si: float
     engineering_unit: str
     censor_type: Optional[str]
+    measurement_category: str
     measurement_key: str
 
 
@@ -152,6 +172,7 @@ class MeasurementBaseline:
     to_node: str
     metric_name: str
     engineering_unit: str
+    measurement_category: str
     sample_count_total: int = 0
     sample_count_uncensored: int = 0
     sample_count_lower_censored: int = 0
@@ -206,9 +227,17 @@ class W434ReportParser:
         overall_result = metadata.get("overall_result", "")
         report_datetime = metadata.get("datetime", "")
         serial_number = metadata.get("serial_number", "")
+        active_section_kind = SECTION_KIND_OTHER
+        active_parameters_text = ""
 
         for line in lines:
             if not line or self._is_non_data_line(line):
+                continue
+
+            parameter_section_text = self._extract_parameter_section_text(line)
+            if parameter_section_text is not None:
+                active_parameters_text = parameter_section_text
+                active_section_kind = self._section_kind_from_parameters_text(parameter_section_text)
                 continue
 
             line_match = RESULT_LINE_PATTERN.match(line)
@@ -233,6 +262,8 @@ class W434ReportParser:
                 line_result=line_result,
                 test_name=test_name,
                 payload_parts=payload_parts,
+                active_section_kind=active_section_kind,
+                active_parameters_text=active_parameters_text,
             )
             records.extend(parsed_records)
 
@@ -295,6 +326,8 @@ class W434ReportParser:
         line_result: str,
         test_name: str,
         payload_parts: list[str],
+        active_section_kind: str,
+        active_parameters_text: str,
     ) -> list[MeasurementRecord]:
         """Parses the measurement part of a passed/failed result line."""
         measurement_text = payload_parts[-1]
@@ -326,6 +359,11 @@ class W434ReportParser:
                 to_node=to_node,
                 metric_name="IR",
                 parsed_value=ir_value,
+                measurement_category=self._resolve_measurement_category(
+                    active_section_kind=active_section_kind,
+                    active_parameters_text=active_parameters_text,
+                    engineering_unit=ir_value.display_unit,
+                ),
             )
             ii_record = self._build_measurement_record(
                 unit_under_test=unit_under_test,
@@ -339,6 +377,11 @@ class W434ReportParser:
                 to_node=to_node,
                 metric_name="II",
                 parsed_value=ii_value,
+                measurement_category=self._resolve_measurement_category(
+                    active_section_kind=active_section_kind,
+                    active_parameters_text=active_parameters_text,
+                    engineering_unit=ii_value.display_unit,
+                ),
             )
             return [ir_record, ii_record]
 
@@ -355,6 +398,11 @@ class W434ReportParser:
             to_node=to_node,
             metric_name="VALUE",
             parsed_value=parsed_value,
+            measurement_category=self._resolve_measurement_category(
+                active_section_kind=active_section_kind,
+                active_parameters_text=active_parameters_text,
+                engineering_unit=parsed_value.display_unit,
+            ),
         )
         return [record]
 
@@ -371,9 +419,11 @@ class W434ReportParser:
         to_node: str,
         metric_name: str,
         parsed_value: ParsedValue,
+        measurement_category: str,
     ) -> MeasurementRecord:
         """Builds a normalized measurement record."""
         measurement_key = self._make_measurement_key(
+            measurement_category=measurement_category,
             test_name=test_name,
             from_node=from_node,
             to_node=to_node,
@@ -394,11 +444,13 @@ class W434ReportParser:
             numeric_value_si=parsed_value.numeric_value_si,
             engineering_unit=parsed_value.display_unit,
             censor_type=parsed_value.censor_type,
+            measurement_category=measurement_category,
             measurement_key=measurement_key,
         )
 
     def _make_measurement_key(
         self,
+        measurement_category: str,
         test_name: str,
         from_node: str,
         to_node: str,
@@ -406,11 +458,81 @@ class W434ReportParser:
     ) -> str:
         """Builds a stable baseline key for one logical measurement."""
         return "|".join([
+            measurement_category.strip(),
             test_name.strip(),
             from_node.strip(),
             to_node.strip(),
             metric_name.strip(),
         ])
+
+    def _extract_parameter_section_text(self, line: str) -> Optional[str]:
+        """Extracts parameters section text from a line.
+
+        Args:
+            line: Raw report line.
+
+        Returns:
+            Section text after "Parameters for", or None if not a section line.
+        """
+        section_match = PARAMETERS_SECTION_PATTERN.match(line.strip())
+        if section_match is None:
+            return None
+        return section_match.group(1).strip()
+
+    def _section_kind_from_parameters_text(self, parameters_text: str) -> str:
+        """Maps parameters section text to a section kind.
+
+        Args:
+            parameters_text: Text after "Parameters for".
+
+        Returns:
+            Section kind used for in-context measurement classification.
+        """
+        normalized = re.sub(r"\s+", " ", parameters_text.strip().lower())
+        if "continuity" in normalized:
+            return SECTION_KIND_CONTINUITY
+        if "lv isolation" in normalized:
+            return SECTION_KIND_LV_ISOLATION
+        if "hv isolation" in normalized:
+            return SECTION_KIND_HV_ISOLATION
+        return SECTION_KIND_OTHER
+
+    def is_resistance_unit(self, unit_text: str) -> bool:
+        """Checks whether a parsed engineering unit is a resistance unit."""
+        return unit_text in RESISTANCE_UNITS
+
+    def is_current_unit(self, unit_text: str) -> bool:
+        """Checks whether a parsed engineering unit is a current unit."""
+        return unit_text in CURRENT_UNITS
+
+    def _resolve_measurement_category(
+        self,
+        active_section_kind: str,
+        active_parameters_text: str,
+        engineering_unit: str,
+    ) -> str:
+        """Determines the measurement category using active section context.
+
+        Args:
+            active_section_kind: Most recently seen parameters section kind.
+            active_parameters_text: Most recently seen parameters section text.
+            engineering_unit: Parsed engineering unit for this measurement.
+
+        Returns:
+            One of the supported measurement category values.
+        """
+        _ = active_parameters_text
+        if active_section_kind == SECTION_KIND_CONTINUITY:
+            return MEASUREMENT_CATEGORY_CONTINUITY
+        if active_section_kind == SECTION_KIND_LV_ISOLATION:
+            return MEASUREMENT_CATEGORY_LV_ISOLATION
+        if active_section_kind == SECTION_KIND_HV_ISOLATION:
+            if self.is_resistance_unit(engineering_unit):
+                return MEASUREMENT_CATEGORY_HV_ISOLATION_RESISTANCE
+            if self.is_current_unit(engineering_unit):
+                return MEASUREMENT_CATEGORY_HV_DIELECTRIC_BREAKDOWN
+            return MEASUREMENT_CATEGORY_OTHER
+        return MEASUREMENT_CATEGORY_OTHER
 
     def _parse_scalar_value(self, raw_value_text: str) -> ParsedValue:
         """Parses one scalar engineering value such as >8.168GOhm or 6.741nF."""
@@ -567,6 +689,7 @@ class BaselineBuilder:
                 to_node=prototype_record.to_node,
                 metric_name=prototype_record.metric_name,
                 engineering_unit=prototype_record.engineering_unit,
+                measurement_category=prototype_record.measurement_category,
                 sample_count_total=len(measurement_records),
                 sample_count_uncensored=len(uncensored_values),
                 sample_count_lower_censored=len(lower_censored_values),
@@ -599,7 +722,15 @@ class BaselineLoader:
         units: dict[str, UnitBaseline] = {}
         for unit_name, unit_payload in payload["units"].items():
             measurement_baselines = {
-                measurement_key: MeasurementBaseline(**measurement_payload)
+                measurement_key: MeasurementBaseline(
+                    **{
+                        **measurement_payload,
+                        "measurement_category": measurement_payload.get(
+                            "measurement_category",
+                            MEASUREMENT_CATEGORY_OTHER,
+                        ),
+                    }
+                )
                 for measurement_key, measurement_payload in unit_payload["measurement_baselines"].items()
             }
             units[unit_name] = UnitBaseline(
@@ -898,6 +1029,24 @@ def print_build_summary(baseline_database: BaselineDatabase) -> None:
             f"passed_reports={unit_baseline.passed_report_count}, "
             f"measurements={len(unit_baseline.measurement_baselines)}"
         )
+        grouped_counts: dict[str, int] = {}
+        for measurement_baseline in unit_baseline.measurement_baselines.values():
+            display_group = classify_test_group(measurement_baseline.measurement_category)
+            grouped_counts[display_group] = grouped_counts.get(display_group, 0) + 1
+        for display_group, group_count in sorted(grouped_counts.items()):
+            print(f"    - {display_group}: {group_count}")
+
+
+def classify_test_group(measurement_category: str) -> str:
+    """Maps measurement category values to user-facing baseline group labels."""
+    label_map = {
+        MEASUREMENT_CATEGORY_CONTINUITY: "Continuity",
+        MEASUREMENT_CATEGORY_LV_ISOLATION: "Low Voltage Isolation",
+        MEASUREMENT_CATEGORY_HV_ISOLATION_RESISTANCE: "High Voltage Isolation",
+        MEASUREMENT_CATEGORY_HV_DIELECTRIC_BREAKDOWN: "Dielectric Breakdown",
+        MEASUREMENT_CATEGORY_OTHER: "Other",
+    }
+    return label_map.get(measurement_category, "Other")
 
 
 
