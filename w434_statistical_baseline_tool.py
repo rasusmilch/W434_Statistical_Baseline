@@ -1106,6 +1106,157 @@ def classify_test_group(measurement_category: str) -> str:
     return label_map.get(measurement_category, "Other")
 
 
+def format_plain_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Formats rows as a simple left/right aligned plain-text table."""
+    all_rows = [headers] + rows
+    column_widths = [
+        max(len(str(row[column_index])) for row in all_rows)
+        for column_index in range(len(headers))
+    ]
+    right_aligned_headers = {"Reports", "Passed", "Measurements", "Samples"}
+
+    def format_row(row: list[str]) -> str:
+        rendered_cells: list[str] = []
+        for column_index, cell in enumerate(row):
+            width = column_widths[column_index]
+            header_name = headers[column_index]
+            if header_name in right_aligned_headers:
+                rendered_cells.append(str(cell).rjust(width))
+            else:
+                rendered_cells.append(str(cell).ljust(width))
+        return "   ".join(rendered_cells)
+
+    header_line = format_row(headers)
+    separator_line = "-" * len(header_line)
+    body_lines = [format_row(row) for row in rows]
+    return "\n".join([header_line, separator_line] + body_lines)
+
+
+def print_assembly_list_table(baseline_database: BaselineDatabase) -> None:
+    """Prints a compact summary table of all assemblies in the baseline."""
+    print("Assemblies in baseline:")
+    print("")
+    headers = ["Unit Under Test", "Reports", "Passed", "Measurements"]
+    rows: list[list[str]] = []
+    for unit_name, unit_baseline in sorted(baseline_database.units.items()):
+        rows.append(
+            [
+                unit_name,
+                str(unit_baseline.report_count),
+                str(unit_baseline.passed_report_count),
+                str(len(unit_baseline.measurement_baselines)),
+            ]
+        )
+
+    if not rows:
+        print("No assemblies found in baseline.")
+        return
+
+    print(format_plain_table(headers=headers, rows=rows))
+
+
+def iter_grouped_measurement_baselines(
+    unit_baseline: UnitBaseline,
+) -> Iterable[tuple[str, list[MeasurementBaseline]]]:
+    """Yields populated baseline display groups in the required display order."""
+    display_order = [
+        "Continuity",
+        "Low Voltage Isolation",
+        "High Voltage Isolation",
+        "Dielectric Breakdown",
+        "Other",
+    ]
+    grouped_measurements: dict[str, list[MeasurementBaseline]] = {
+        display_name: [] for display_name in display_order
+    }
+    for measurement_baseline in unit_baseline.measurement_baselines.values():
+        display_group = classify_test_group(measurement_baseline.measurement_category)
+        grouped_measurements.setdefault(display_group, []).append(measurement_baseline)
+
+    for display_group in display_order:
+        records = grouped_measurements.get(display_group, [])
+        if not records:
+            continue
+        sorted_records = sorted(
+            records,
+            key=lambda baseline: (
+                baseline.test_name,
+                baseline.from_node,
+                baseline.to_node,
+                baseline.metric_name,
+            ),
+        )
+        yield display_group, sorted_records
+
+
+def print_unit_baseline_table(unit_baseline: UnitBaseline) -> None:
+    """Prints detailed grouped baseline rows for one unit under test."""
+    print(f"Unit under test: {unit_baseline.unit_under_test}")
+    print(f"Reports: {unit_baseline.report_count}")
+    print(f"Passed reports: {unit_baseline.passed_report_count}")
+    print(f"Measurement baselines: {len(unit_baseline.measurement_baselines)}")
+
+    headers = [
+        "Test Name",
+        "From",
+        "To",
+        "Metric",
+        "Unit",
+        "Samples",
+        "Mean",
+        "Median",
+        "Std Dev",
+        "Min",
+        "Max",
+        "Floor",
+        "Ceiling",
+    ]
+    for display_group, records in iter_grouped_measurement_baselines(unit_baseline):
+        print("")
+        print(f"=== {display_group} ===")
+        rows: list[list[str]] = []
+        for measurement_baseline in records:
+            engineering_unit = measurement_baseline.engineering_unit
+            rows.append(
+                [
+                    measurement_baseline.test_name,
+                    measurement_baseline.from_node,
+                    measurement_baseline.to_node,
+                    measurement_baseline.metric_name,
+                    engineering_unit or "N/A",
+                    str(measurement_baseline.sample_count_total),
+                    format_si_value(measurement_baseline.mean_value_si, engineering_unit),
+                    format_si_value(measurement_baseline.median_value_si, engineering_unit),
+                    format_si_value(measurement_baseline.population_stddev_si, engineering_unit),
+                    format_si_value(measurement_baseline.minimum_value_si, engineering_unit),
+                    format_si_value(measurement_baseline.maximum_value_si, engineering_unit),
+                    format_si_value(measurement_baseline.baseline_floor_value_si, engineering_unit),
+                    format_si_value(measurement_baseline.baseline_ceiling_value_si, engineering_unit),
+                ]
+            )
+        print(format_plain_table(headers=headers, rows=rows))
+
+
+def baseline_info_command(arguments: argparse.Namespace) -> int:
+    """Prints baseline information for all units or one selected unit."""
+    baseline_json_path = Path(arguments.baseline_json)
+    loader = BaselineLoader()
+    baseline_database = loader.load_from_json(baseline_json_path)
+
+    if not arguments.unit_under_test:
+        print_assembly_list_table(baseline_database)
+        return 0
+
+    selected_unit = arguments.unit_under_test.strip()
+    unit_baseline = baseline_database.units.get(selected_unit)
+    if unit_baseline is None:
+        print(f"ERROR: Unit under test not found in baseline: {selected_unit!r}")
+        return 1
+
+    print_unit_baseline_table(unit_baseline)
+    return 0
+
+
 
 def format_si_value(value_si: Optional[float], engineering_unit: Optional[str]) -> str:
     """Formats an SI-base numeric value back into the stored engineering unit.
@@ -1434,6 +1585,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Parse a directory of reports and build a baseline JSON file.",
     )
     build_parser.add_argument(
+        "-i",
         "--input-dir",
         dest="input_dirs",
         action="append",
@@ -1446,11 +1598,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser.add_argument(
+        "-o",
         "--output-json",
         required=True,
         help="Path to write the baseline JSON file.",
     )
     build_parser.add_argument(
+        "-r",
         "--recursive",
         action="store_true",
         help="Recursively search subdirectories for report files.",
@@ -1462,22 +1616,26 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Evaluate one report against a saved baseline JSON file.",
     )
     evaluate_parser.add_argument(
+        "-b",
         "--baseline-json",
         required=True,
         help="Path to the saved baseline JSON file.",
     )
     evaluate_parser.add_argument(
+        "-p",
         "--report",
         required=True,
         help="Path to the new report file to evaluate.",
     )
     evaluate_parser.add_argument(
+        "-z",
         "--z-threshold",
         type=float,
         default=3.0,
         help="Absolute Z-score threshold used to flag numeric outliers. Default: 3.0",
     )
     evaluate_parser.add_argument(
+        "-o",
         "--output-json",
         help="Optional path to save the evaluation result as JSON.",
     )
@@ -1488,11 +1646,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Evaluate all candidate reports in a directory against a saved baseline JSON file.",
     )
     evaluate_dir_parser.add_argument(
+        "-b",
         "--baseline-json",
         required=True,
         help="Path to the saved baseline JSON file.",
     )
     evaluate_dir_parser.add_argument(
+        "-i",
         "--input-dir",
         dest="input_dirs",
         action="append",
@@ -1505,11 +1665,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     evaluate_dir_parser.add_argument(
+        "-r",
         "--recursive",
         action="store_true",
         help="Recursively search subdirectories for report files.",
     )
     evaluate_dir_parser.add_argument(
+        "-z",
         "--z-threshold",
         type=float,
         default=3.0,
@@ -1521,14 +1683,33 @@ def create_argument_parser() -> argparse.ArgumentParser:
         help="Only print reports that are not statistically consistent.",
     )
     evaluate_dir_parser.add_argument(
+        "-o",
         "--output-json",
         help="Optional path to save batch evaluation results as JSON.",
     )
     evaluate_dir_parser.add_argument(
+        "-c",
         "--output-csv",
         help="Optional path to save a one-line-per-report CSV summary.",
     )
     evaluate_dir_parser.set_defaults(func=evaluate_directory_command)
+
+    baseline_info_parser = subparsers.add_parser(
+        "baseline-info",
+        help="Print summary information from a saved baseline JSON file.",
+    )
+    baseline_info_parser.add_argument(
+        "-b",
+        "--baseline-json",
+        required=True,
+        help="Path to the saved baseline JSON file.",
+    )
+    baseline_info_parser.add_argument(
+        "-u",
+        "--unit-under-test",
+        help="Optional unit under test to print detailed grouped baseline rows.",
+    )
+    baseline_info_parser.set_defaults(func=baseline_info_command)
 
     return argument_parser
 
