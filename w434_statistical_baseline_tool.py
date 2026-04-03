@@ -228,7 +228,6 @@ class W434ReportParser:
 
         metadata = self._extract_metadata(lines)
         if self._header_has_failure(lines):
-            print(f"Skipping report due to header failure: {report_path}")
             return metadata, []
 
         records: list[MeasurementRecord] = []
